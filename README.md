@@ -6,7 +6,8 @@ Single-screen iOS app whose entire UI is driven by a local JSON payload. Built f
 - **Minimum deployment target:** iOS 16.0
 - **Devices:** iPhone + iPad, portrait + landscape
 - **Network:** Fully offline; JSON is loaded from the app bundle
-- **Tests:** 30 XCTest cases covering polymorphic decoding, defensive parsing, validation, and theme parsing
+- **Persistence:** Draft recovery via Core Data — in-progress edits are written continuously, cleared on successful Save
+- **Tests:** XCTest cases covering polymorphic decoding, defensive parsing, validation, theme parsing, and persistence round-trip
 
 ## Run
 
@@ -47,7 +48,8 @@ JSON file ─► FormSchemaLoader (protocol)
 | `Models/` | JSON→Swift engine. `FormSchema`, `FormField` (struct + nested `FieldKind` enum), specs per type, `FieldDefault`, `FieldValue` |
 | `Codable/` | `LossyArray` property wrapper + `AnyDecodableSkip` for graceful per-element decoding |
 | `Services/` | `FormSchemaLoader` protocol + `BundleFormLoader` (real) + `MockFormLoader` (tests) + typed `FormLoadError` |
-| `Validation/` | `Validator` protocol with `RequiredValidator`, `MaxLengthValidator`, `RegexValidator` — Open/Closed: add new rules without touching the VM |
+| `Validation/` | `Validator` protocol with `DropdownAvailabilityValidator`, `RequiredValidator`, `MaxLengthValidator`, `URLFormatValidator`, `RegexValidator` — Open/Closed: add new rules without touching the VM |
+| `Persistence/` | `FormStatePersistence` protocol + `CoreDataFormStatePersistence` (real, programmatic NSManagedObjectModel) + `InMemoryFormStatePersistence` (tests) + `FieldValue` Codable conformance |
 | `Theming/` | `AppColors` (hex → SwiftUI Color), `AppFonts` type scale, environment key |
 | `Utilities/` | `Color(hex:)` initializer |
 | `ViewModels/` | `FormViewModel` + `LoadingState` |
@@ -98,7 +100,21 @@ Each row reads its value via a typed binding into the view model — rows own no
 
 - **Save button** at the bottom of the form. Tapping it runs all validators and either prints the final key-value JSON dump to the Xcode console + shows a confirmation alert, or populates per-field error messages.
 - **Errors clear** as the user edits.
-- **Four validators today** (`DropdownAvailability`, `Required`, `MaxLength`, `Regex`) — adding a new rule means adding a `Validator` conformance and listing it in the view model's validators array. No other files change. Order matters: the view model breaks on the first invalid result per field, so more specific validators (e.g. `DropdownAvailability`) run before generic ones (e.g. `Required`).
+- **Five validators today** (`DropdownAvailability`, `Required`, `MaxLength`, `URLFormat`, `Regex`) — adding a new rule means adding a `Validator` conformance and listing it in the view model's validators array. No other files change. Order matters: the view model breaks on the first invalid result per field, so more specific validators (e.g. `DropdownAvailability`) run before generic ones (e.g. `Required`).
+- **URL validation is a hybrid** — `URLFormatValidator` runs a built-in `URLComponents` parse for any TEXT field with `subtype: URI` (must have non-empty scheme + non-empty host), and the JSON's optional `regex` runs after via `RegexValidator`. So `"https://example.com"` passes baseline + any reasonable regex, `"not-a-url"` fails baseline, and `"http://example.com"` passes baseline but can be rejected by a server-supplied `"^https://"` regex. The baseline doesn't restrict the scheme — that's the server's call.
+
+### Draft persistence
+
+The form's in-progress state is treated as a **draft**, not a permanent record of submissions — same semantic as Gmail drafts:
+
+- **Trigger:** every call to `setValue(_:for:)` schedules a debounced (300 ms by default) persist via a cancellable `Task`. Bursts of edits (typing) coalesce into a single write — only the final snapshot lands.
+- **On successful Save:** `validate()` cancels any pending write and calls `persistence.clear()`. The submission is the user's "done" signal — the draft is no longer interesting.
+- **On failed Save:** the draft is left intact, so the user doesn't lose work between attempts.
+- **On launch:** `load()` reads the draft, normalizes each value against the *current* schema (clamping to today's `max_length`, dropping selections no longer in the option set, etc.), and overlays it on the JSON defaults. If no draft exists, defaults apply as before.
+
+The storage backend is Core Data — a programmatic `NSManagedObjectModel` with one entity (`PersistedFieldValue`) holding `fieldId`, a JSON-encoded `data` blob, and `updatedAt`. No `.xcdatamodeld` file is needed, which keeps the model in source and avoids friction with Xcode's File System Synchronization. The `FieldValue` enum gets `Codable` conformance via a kind-discriminator wrapper so it can round-trip through the blob attribute. Tests use `InMemoryFormStatePersistence` for view-model behavior and `CoreDataStack(inMemory: true)` for Core Data round-trip verification.
+
+> A JSON file or `UserDefaults` would do the same job in fewer lines for a payload this small, but Core Data is the explicit choice for this submission.
 
 ### Focus management
 
@@ -133,7 +149,7 @@ The keyboard toolbar has Previous / Next / Done buttons (via `@FocusState` + `Fo
 ```
 $ xcodebuild test -scheme ServerDrivenUI -destination "platform=iOS Simulator,name=iPhone 17"
 …
-Executed 30 tests, with 0 failures
+** TEST SUCCEEDED **
 ```
 
 | Suite | What it covers |
@@ -143,8 +159,9 @@ Executed 30 tests, with 0 failures
 | `LossyArrayTests` | Malformed elements are skipped; ordering is by `order` field, not array index; missing fields array is OK |
 | `ThemeDecodingTests` | Hex parsing for 6 and 8 char strings; missing theme keys fall back to defaults |
 | `DefaultValueTests` | `default_value` decodes as `String`, `Bool`, `[String]`, or `null` |
-| `ValidationTests` | Required + max_length + regex pass/fail paths; multi-select required when empty |
+| `ValidationTests` | Required + max_length + regex + dropdown-availability + URL-format (hybrid baseline + regex) pass/fail paths; multi-select required when empty |
 | `FormSchemaDecodingTests` | End-to-end on the "all-in-one" payload + view-model default truncation |
+| `PersistenceTests` | `FieldValue` Codable round-trip; Core Data upsert / GC / clear; VM hydrates from draft, persists on edit (debounced), clears draft on successful Save, keeps draft on failed Save, normalizes drafts to current schema |
 
 ## AI tool usage
 

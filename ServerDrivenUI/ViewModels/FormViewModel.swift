@@ -8,16 +8,25 @@ final class FormViewModel: ObservableObject {
     @Published private(set) var errors: [String: String] = [:]
 
     private let loader: FormSchemaLoader
+    private let persistence: FormStatePersistence?
     private let validators: [Validator]
+    private let persistDebounce: Duration
+
+    private var persistTask: Task<Void, Never>?
 
     init(loader: FormSchemaLoader,
+         persistence: FormStatePersistence? = nil,
+         persistDebounce: Duration = .milliseconds(300),
          validators: [Validator] = [
             DropdownAvailabilityValidator(),
             RequiredValidator(),
             MaxLengthValidator(),
+            URLFormatValidator(),
             RegexValidator()
          ]) {
         self.loader = loader
+        self.persistence = persistence
+        self.persistDebounce = persistDebounce
         self.validators = validators
     }
 
@@ -39,12 +48,13 @@ final class FormViewModel: ObservableObject {
         state = .loading
         do {
             let schema = try await loader.load()
+            let draft = (try? await persistence?.load()) ?? [:]
+            primeValues(from: schema, draft: draft)
             if schema.renderableFieldsSortedByOrder.isEmpty {
                 state = .empty
             } else {
                 state = .loaded(schema)
             }
-            primeDefaults(from: schema)
         } catch let error as FormLoadError {
             state = .failure(message: error.errorDescription ?? "Failed to load form.")
         } catch {
@@ -58,13 +68,13 @@ final class FormViewModel: ObservableObject {
     }
 
     func setValue(_ value: FieldValue, for field: FormField) {
-        // Clamp text values to max_length up front so the counter stays honest.
         if case .text(let spec) = field.kind, case .text(let s) = value, let limit = spec.maxLength {
             values[field.id] = .text(String(s.prefix(limit)))
         } else {
             values[field.id] = value
         }
         errors[field.id] = nil
+        schedulePersist()
     }
 
     func error(for field: FormField) -> String? {
@@ -94,15 +104,70 @@ final class FormViewModel: ObservableObject {
         for field in schema.renderableFieldsSortedByOrder {
             output[field.id] = self.value(for: field).asJSON
         }
+
+        // Submission complete — drop the draft so a re-launch starts from JSON defaults.
+        persistTask?.cancel()
+        if let persistence {
+            Task { try? await persistence.clear() }
+        }
+
         return output
     }
 
-    private func primeDefaults(from schema: FormSchema) {
+    /// Debounced fire-and-forget save of the current `values` snapshot.
+    /// Cancellation gives us the debounce: each edit cancels the prior pending
+    /// save and starts a new one. Only the final write within a burst lands.
+    private func schedulePersist() {
+        guard let persistence else { return }
+        persistTask?.cancel()
+        let snapshot = values
+        let delay = persistDebounce
+        persistTask = Task { [weak self] in
+            try? await Task.sleep(for: delay)
+            guard !Task.isCancelled else { return }
+            try? await persistence.save(snapshot)
+            self?.persistTask = nil
+        }
+    }
+
+    private func primeValues(from schema: FormSchema, draft: [String: FieldValue]) {
         var seeded: [String: FieldValue] = [:]
         for field in schema.renderableFieldsSortedByOrder {
-            seeded[field.id] = defaultValue(for: field)
+            if let p = draft[field.id], let normalized = normalize(p, for: field) {
+                seeded[field.id] = normalized
+            } else {
+                seeded[field.id] = defaultValue(for: field)
+            }
         }
         values = seeded
+        // primeValues runs during hydration — do NOT schedulePersist here, that
+        // would re-persist the just-loaded draft and serve no purpose.
+    }
+
+    /// Coerce a draft value to fit the current field's constraints, since the
+    /// JSON schema may have changed since the draft was captured (max_length
+    /// lowered, options removed, etc.). Returns nil if the draft doesn't make
+    /// sense for the current field kind — caller falls back to the default.
+    private func normalize(_ persisted: FieldValue, for field: FormField) -> FieldValue? {
+        switch (field.kind, persisted) {
+        case (.text(let spec), .text(let s)):
+            if let limit = spec.maxLength { return .text(String(s.prefix(limit))) }
+            return .text(s)
+        case (.dropdown(let spec), .single(let id)):
+            guard !spec.allowMultiple else { return nil }
+            let valid = Set(spec.options.map(\.id))
+            return .single(id.flatMap { valid.contains($0) ? $0 : nil })
+        case (.dropdown(let spec), .multi(let set)):
+            guard spec.allowMultiple else { return nil }
+            let valid = Set(spec.options.map(\.id))
+            return .multi(set.intersection(valid))
+        case (.toggle, .bool(let b)):
+            return .bool(b)
+        case (.checkbox, .bool(let b)):
+            return .bool(b)
+        default:
+            return nil
+        }
     }
 
     private func defaultValue(for field: FormField) -> FieldValue {

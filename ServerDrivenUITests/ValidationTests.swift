@@ -91,6 +91,76 @@ final class ValidationTests: XCTestCase {
         XCTAssertTrue(result.isValid)
     }
 
+    // MARK: - URLFormatValidator
+
+    private func uriField(id: String = "u", required: Bool = false, regex: String? = nil) -> FormField {
+        FormField(
+            id: id, order: 0, label: id, required: required, errorMessage: nil,
+            kind: .text(TextSpec(subtype: .uri, placeholder: nil, maxLength: nil, regex: regex, defaultValue: nil))
+        )
+    }
+
+    func testURLBaselinePassesOnValidHttps() {
+        let result = URLFormatValidator().validate(value: .text("https://example.com"), field: uriField())
+        XCTAssertTrue(result.isValid)
+    }
+
+    func testURLBaselinePassesOnAnyScheme() {
+        // Baseline does not restrict the scheme — that's the server's job via regex.
+        XCTAssertTrue(URLFormatValidator().validate(value: .text("ftp://server"), field: uriField()).isValid)
+        XCTAssertTrue(URLFormatValidator().validate(value: .text("https://example.com/path?q=1"), field: uriField()).isValid)
+    }
+
+    func testURLBaselineFailsOnNonUrlText() {
+        XCTAssertFalse(URLFormatValidator().validate(value: .text("not-a-url"), field: uriField()).isValid)
+        XCTAssertFalse(URLFormatValidator().validate(value: .text("just words"), field: uriField()).isValid)
+    }
+
+    func testURLBaselineFailsOnSchemeWithoutHost() {
+        XCTAssertFalse(URLFormatValidator().validate(value: .text("https://"), field: uriField()).isValid)
+        XCTAssertFalse(URLFormatValidator().validate(value: .text("://example.com"), field: uriField()).isValid)
+    }
+
+    func testURLBaselinePassesEmpty() {
+        // Empty is RequiredValidator's domain, not URL's.
+        XCTAssertTrue(URLFormatValidator().validate(value: .text(""), field: uriField()).isValid)
+        XCTAssertTrue(URLFormatValidator().validate(value: .text("   "), field: uriField(required: false)).isValid)
+    }
+
+    func testURLBaselineIgnoresNonUriSubtypes() {
+        let plainField = FormField(
+            id: "x", order: 0, label: "x", required: false, errorMessage: nil,
+            kind: .text(TextSpec(subtype: .plain, placeholder: nil, maxLength: nil, regex: nil, defaultValue: nil))
+        )
+        XCTAssertTrue(URLFormatValidator().validate(value: .text("not-a-url"), field: plainField).isValid)
+    }
+
+    @MainActor
+    func testViewModelStacksUrlBaselineAndJsonRegex() async {
+        // Hybrid: server tightens to HTTPS-only via regex; baseline still rejects garbage.
+        let schema = FormSchema(
+            theme: .fallback, formTitle: "T",
+            fields: [uriField(id: "u", required: true, regex: "^https://.+")]
+        )
+        let vm = FormViewModel(loader: MockFormLoader(schema: schema))
+        await vm.load()
+
+        // Garbage → URL baseline fires (not the regex).
+        vm.setValue(.text("not-a-url"), for: schema.fields[0])
+        XCTAssertNil(vm.validate())
+        XCTAssertEqual(vm.error(for: schema.fields[0]),
+                       "u must be a valid URL (e.g., https://example.com).")
+
+        // Valid URL but wrong scheme → URL baseline passes, regex fires.
+        vm.setValue(.text("http://example.com"), for: schema.fields[0])
+        XCTAssertNil(vm.validate())
+        XCTAssertEqual(vm.error(for: schema.fields[0]), "u format is invalid.")
+
+        // Right scheme → both pass.
+        vm.setValue(.text("https://example.com"), for: schema.fields[0])
+        XCTAssertNotNil(vm.validate())
+    }
+
     @MainActor
     func testViewModelEmitsMisconfigurationMessageForRequiredEmptyDropdown() async {
         let schema = FormSchema(
